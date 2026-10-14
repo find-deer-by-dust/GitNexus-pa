@@ -7,7 +7,18 @@
 
 import fs from 'fs/promises';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { sanitizeMermaidMarkdown } from './mermaid-sanitizer.js';
+
+/**
+ * Directory holding the vendored client-side libraries (marked, mermaid).
+ * Resolves from both `src/core/wiki/` (tsx dev) and `dist/core/wiki/`
+ * (compiled) — `../docs` holds in both layouts.
+ */
+const DOCS_ASSETS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'docs');
+
+/** Client-side libraries copied next to index.html for offline viewing. */
+const VENDORED_LIBS = ['marked.min.js', 'mermaid.min.js'];
 
 interface ModuleTreeNode {
   name: string;
@@ -44,6 +55,12 @@ export async function generateHTMLViewer(wikiDir: string, projectName: string): 
   for (const f of dirEntries.filter((f) => f.endsWith('.md'))) {
     const content = await fs.readFile(path.join(wikiDir, f), 'utf-8');
     pages[f.replace(/\.md$/, '')] = sanitizeMermaidMarkdown(content);
+  }
+
+  // Copy vendored client-side libraries next to index.html so the wiki
+  // works offline (no CDN access required).
+  for (const lib of VENDORED_LIBS) {
+    await fs.copyFile(path.join(DOCS_ASSETS_DIR, lib), path.join(wikiDir, lib));
   }
 
   const html = buildHTML(projectName, moduleTree, pages, meta);
@@ -84,10 +101,8 @@ function buildHTML(
   parts.push('<meta charset="UTF-8">');
   parts.push('<meta name="viewport" content="width=device-width, initial-scale=1.0">');
   parts.push('<title>' + esc(projectName) + ' — Wiki</title>');
-  parts.push('<script src="https://cdn.jsdelivr.net/npm/marked@11.0.0/marked.min.js"><\/script>');
-  parts.push(
-    '<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"><\/script>',
-  );
+  parts.push('<script src="./marked.min.js"><\/script>');
+  parts.push('<script src="./mermaid.min.js"><\/script>');
   parts.push('<style>');
   parts.push(CSS);
   parts.push('</style>');

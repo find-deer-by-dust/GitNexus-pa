@@ -80,6 +80,13 @@ runTsc(ROOT);
 console.log('[build] copying shared module into dist/_shared…');
 fs.cpSync(path.join(SHARED_ROOT, 'dist'), SHARED_DEST, { recursive: true });
 
+// ── 3b. Copy vendored wiki viewer assets ───────────────────────────
+// tsc does not emit .js assets from src/; the wiki HTML viewer loads
+// marked/mermaid from ../docs at runtime.
+fs.cpSync(path.join(ROOT, 'src', 'core', 'docs'), path.join(DIST, 'core', 'docs'), {
+  recursive: true,
+});
+
 // ── 4. Rewrite imports ─────────────────────────────────────────────
 console.log('[build] rewriting gitnexus-shared imports…');
 let rewritten = 0;
