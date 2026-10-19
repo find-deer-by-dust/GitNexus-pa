@@ -365,7 +365,7 @@ export async function callLLM(
   }
 
   // max_tokens is deprecated; use max_completion_tokens for all models
-  body.max_completion_tokens = config.maxTokens;
+  // body.max_completion_tokens = config.maxTokens;
 
   // Only send temperature for non-Azure providers — some Azure models reject non-default values
   if (!reasoning && !azure && config.temperature !== undefined) {
