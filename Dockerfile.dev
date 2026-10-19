@@ -1,0 +1,417 @@
+# =============================================================================
+# GitNexus — single-image ("all-in-one") build + runtime + development image
+#
+# WHY THIS FILE EXISTS
+#   Dockerfile.cli and Dockerfile.web both build in a throwaway `builder` stage
+#   and ship a deliberately STRIPPED runtime: no source tree, no npm, no
+#   Python/make/g++, and no rebuild path. They cannot rebuild themselves.
+#
+#   This file is the opposite trade-off. It has exactly ONE stage, and that
+#   stage carries everything needed to compile the project:
+#     * the complete monorepo source tree                     -> /app
+#     * every dependency, dev dependencies included           -> node_modules
+#       (root + gitnexus + gitnexus-web + gitnexus-shared)
+#     * the native toolchain (python3 / make / g++ / node-gyp)
+#     * a working npm + npx (Dockerfile.cli deletes both)
+#     * prebuilt dist/ and web/ so the service runs immediately
+#   So you can `docker exec` in, edit any source file, and rebuild in place —
+#   no second container, no bind-mounted toolchain.
+#
+#   Cost: the image is much larger than Dockerfile.cli. That is the whole point.
+#
+# ONE CONTAINER SERVES EVERYTHING
+#   `gitnexus serve` hosts the API *and* the web UI on one port (4747), so the
+#   separate gitnexus-web container from docker-compose.yaml is not needed.
+#
+# QUICK USE
+#   docker build -f Dockerfile.dev -t gitnexus:dev .
+#   docker run --rm -p 4747:4747 -v gitnexus-data:/data/gitnexus gitnexus:dev
+#   docker exec -it <container> bash
+#     # inside the container:
+#     nano gitnexus/src/cli/index.ts
+#     gitnexus-rebuild      # rebuild dist/ + web/ in place, then restart the server
+#
+# BUILD OPTIONS (all optional)
+#   --build-arg NPM_REGISTRY=https://registry.npmmirror.com   # npm mirror
+#   --build-arg BAKE_EMBEDDINGS=1                             # + local embeddings
+#   --build-arg BAKE_VECTOR_EXTENSION=1                       # + VECTOR index ext
+#   --build-arg HF_ENDPOINT=https://hf-mirror.com             # HF mirror
+#   --build-arg SKIP_SELF_TEST=1                              # skip the build gate
+#
+# Build with BuildKit (default in Docker 23+), from the REPOSITORY ROOT — the
+# directory holding this file — so the build context and the repo's
+# .dockerignore line up:
+#   docker build -f Dockerfile.dev -t gitnexus:dev .
+# =============================================================================
+
+ARG NPM_VERSION=11.14.1
+# Matches the node-gyp that npm 11.14.1 bundles, so vendored grammar source
+# builds resolve exactly one node-gyp.
+ARG NODE_GYP_VERSION=12.3.0
+
+# node:22-bookworm-slim — the same pinned digest as Dockerfile.cli,
+# Dockerfile.web and gitnexus/Dockerfile.test, so every image in this repo
+# shares one Node. It resolves to Node 22.22.x, which satisfies gitnexus'
+# `engines` range (`^22.18.0 || >=24.11.0`).
+FROM node:22-bookworm-slim@sha256:9f6d5975c7dca860947d3915877f85607946403fc55349f39b4bc3688448bb6e
+
+ARG NPM_VERSION
+ARG NODE_GYP_VERSION
+# Optional npm mirror, e.g. https://registry.npmmirror.com. Written to the
+# GLOBAL npmrc so it applies to every `npm ci` in this build AND to installs
+# you run inside the container afterwards.
+ARG NPM_REGISTRY=
+# Optional runtime extras. Both default OFF so a plain `docker build` needs
+# nothing beyond a reachable npm registry; see the sections below.
+ARG BAKE_EMBEDDINGS=0
+ARG BAKE_VECTOR_EXTENSION=0
+# HuggingFace mirror for the optional model download.
+ARG HF_ENDPOINT=
+# Escape hatch for the end-of-build self test.
+ARG SKIP_SELF_TEST=0
+
+WORKDIR /app
+
+# Docker does NOT derive HOME from USER, so it is pinned explicitly — the same
+# convention Dockerfile.cli uses. This is load-bearing, not cosmetic:
+#   * the VECTOR extension is looked up at $HOME/.lbdb/extension/<v>/<plat>/…,
+#     NOT under $GITNEXUS_HOME (verified: moving it from HOME to GITNEXUS_HOME
+#     makes `doctor` flip from "available" to "unavailable"),
+#   * the embedding runtime resolves to $HOME/.gitnexus/embedding-runtime,
+#   * the model cache resolves to $HOME/.cache/huggingface (HF_HOME else homedir),
+#   * npm's cache lives at $HOME/.npm.
+# If HOME changed after the layers below, the baked extension and model would
+# become invisible at runtime.
+ENV HOME=/home/node
+
+# -----------------------------------------------------------------------------
+# 1. Native build toolchain
+#
+#   python3/make/g++ are what node-gyp needs. Because this image has no builder
+#   stage, the toolchain has to live in the FINAL image — both for the build
+#   below and for every rebuild you do inside the container.
+#
+#   git + openssh-client: cloning/indexing remotes and `gitnexus auto-sync`.
+#   curl: container healthcheck and general debugging.
+#   procps: `watch` process identity (same set as Dockerfile.cli).
+#   nano: you are meant to edit source in here. Deliberately NOT vim-tiny —
+#   that package installs only /usr/bin/vim.tiny (it does not provide `vim`),
+#   and the real `vim` package drags in a 36 MB vim-runtime for no benefit here.
+#
+# apt versions are intentionally unpinned: bookworm-slim moves patch versions
+# and a pin here would break the build on the next point release.
+# -----------------------------------------------------------------------------
+# hadolint ignore=DL3008
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 \
+      make \
+      g++ \
+      pkg-config \
+      git \
+      curl \
+      procps \
+      ca-certificates \
+      openssh-client \
+      xz-utils \
+      unzip \
+      nano \
+      vim \
+ && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# 2. Pin npm, and install node-gyp globally
+#
+#   Upstream pins npm for reproducibility; this does the same. npm is kept at
+#   runtime on purpose (Dockerfile.cli deletes it) — it is how you add a
+#   dependency from inside the container.
+#
+#   node-gyp is installed GLOBALLY so the `npx node-gyp rebuild` call inside
+#   gitnexus/scripts/build-tree-sitter-grammars.cjs resolves locally instead of
+#   making npx download node-gyp mid-build. Without it, a vendored grammar with
+#   no prebuild for this platform/arch cannot be compiled when the registry is
+#   unreachable.
+#
+#   The root npm cache is redirected to /tmp and deleted, so this layer cannot
+#   leave root-owned files inside the `node` user's HOME.
+# -----------------------------------------------------------------------------
+RUN export npm_config_cache=/tmp/root-npm-cache; \
+    if [ -n "${NPM_REGISTRY}" ]; then \
+      npm config set registry "${NPM_REGISTRY}" --location=global; \
+      npm config get registry --location=global; \
+    fi \
+ && npx --yes npm@${NPM_VERSION} install -g npm@${NPM_VERSION} node-gyp@${NODE_GYP_VERSION} \
+ && npm --version \
+ && node-gyp --version \
+ && rm -rf /tmp/root-npm-cache
+
+# -----------------------------------------------------------------------------
+# 3. Keep dev dependencies
+#
+#   THE single most important line in this file. npm drops devDependencies when
+#   NODE_ENV=production or --omit=dev is in play, which would remove typescript,
+#   tsx, vite, vitest and the type definitions — and then nothing could be
+#   rebuilt inside the container. `include=dev` overrides both, so every install
+#   in this build and every install you run later keeps the toolchain.
+#
+#   NODE_ENV is deliberately NOT set to production: GitNexus' own CLI runs with
+#   it unset, and leaving it unset means a plain `npm ci` in the container can
+#   never silently strip the toolchain either. Pass `-e NODE_ENV=production` at
+#   `docker run` if you want the leaner analyze path used by the shipped
+#   Dockerfile.cli image.
+# -----------------------------------------------------------------------------
+ENV NPM_CONFIG_INCLUDE=dev
+
+# -----------------------------------------------------------------------------
+# 4. Dependencies — resolved from the lockfiles, before any source is copied
+#
+#   Splitting manifests from source keeps these slow, several-hundred-MB layers
+#   valid when you edit a .ts file or pull new source. `npm ci` everywhere, so
+#   the installed tree matches the committed lockfiles exactly.
+#
+#   Root goes first: gitnexus-web and gitnexus both depend on gitnexus-shared
+#   via `file:../gitnexus-shared`, so that tree has to exist before either
+#   installs.
+# -----------------------------------------------------------------------------
+COPY --chown=node:node package.json package-lock.json ./
+COPY --chown=node:node gitnexus-shared/package.json gitnexus-shared/package-lock.json ./gitnexus-shared/
+COPY --chown=node:node gitnexus-web/package.json gitnexus-web/package-lock.json ./gitnexus-web/
+COPY --chown=node:node gitnexus/package.json gitnexus/package-lock.json ./gitnexus/
+
+# WORKDIR creates /app as root, and COPY only applies --chown to what it copies
+# (not necessarily to /app itself). npm ci has to create /app/node_modules and
+# write into each package directory, so make the whole tree node-owned up front.
+RUN chown -R node:node /app
+
+# Everything below runs as the unprivileged `node` user (uid 1000).
+# Running installs as `node` means /app and every node_modules tree — including
+# any native module compiled from source — are owned by the user you will be
+# editing as, so no root-owned artifacts trip you up later.
+USER node
+
+# HUSKY=0: the root `prepare` script is `husky`, a no-op without a .git
+# directory (.dockerignore excludes one) that otherwise prints a warning.
+RUN HUSKY=0 npm ci \
+ && npm ci --prefix gitnexus-shared \
+ && npm ci --prefix gitnexus-web
+# gitnexus' own `postinstall`/`prepare` compile native code and TypeScript, so
+# they cannot run before its source exists: install dependencies only for now.
+RUN npm ci --prefix gitnexus --ignore-scripts
+
+# -----------------------------------------------------------------------------
+# 5. The source tree
+#
+#   The repo's .dockerignore keeps this lean: no node_modules, no dist, no .git,
+#   no *.tsbuildinfo. Only .git is really lost (history); the deliverable stays
+#   small. Run `git init` inside the container if you want diffs.
+# -----------------------------------------------------------------------------
+COPY --chown=node:node . .
+
+# -----------------------------------------------------------------------------
+# 6. Native/lifecycle scripts, now that source + vendor/ are present
+#
+#   `npm rebuild` re-runs the install scripts step 4 skipped. That matters for
+#   @ladybugdb/core (its install.js selects the platform native addon) and for
+#   tree-sitter's node-gyp-build.
+#
+#   `npm run postinstall` then materializes the VENDORED tree-sitter grammars
+#   (c/objc/dart/proto/swift/kotlin/zig) under gitnexus/vendor/. They are not
+#   optional extras: tree-sitter-c and tree-sitter-objc are REQUIRED backstops
+#   for the upstream ARM prebuild gap. The committed prebuilds cover
+#   linux-x64/arm64, so a normal build needs no compiler here; if a prebuild is
+#   missing, the toolchain from step 1 compiles it from source.
+#
+#   Deliberately no `npm prune --omit=dev` (which Dockerfile.cli needs): the dev
+#   dependencies ARE the in-container build environment.
+# -----------------------------------------------------------------------------
+RUN npm rebuild --prefix gitnexus \
+ && npm run postinstall --prefix gitnexus
+
+# -----------------------------------------------------------------------------
+# 7. Build the product
+#
+#   `build:web` == `node scripts/build.js --web`, which:
+#     a. compiles gitnexus-shared (tsc)
+#     b. compiles gitnexus (tsc) and inlines gitnexus-shared into dist/_shared
+#     c. builds gitnexus-web (tsc -b && vite build)
+#     d. copies the web UI bundle into gitnexus/web/
+#   A plain `npm run build` (no --web) DELETES gitnexus/web, so `build:web` is
+#   the correct target whenever the UI must be servable from this container.
+# -----------------------------------------------------------------------------
+RUN npm run build:web --prefix gitnexus
+
+# -----------------------------------------------------------------------------
+# 8. Bake optional runtime extras
+#
+#   Full-text search needs no work here: it ships in
+#   gitnexus/vendor/lbug-fts/prebuilds/ and ExtensionManager LOADs that path
+#   directly, so FTS works offline with an empty ~/.lbdb.
+#
+#   The other two are network downloads, which is why they are opt-in — a
+#   default `docker build` should not fail just because extension.ladybugdb.com
+#   or huggingface.co is unreachable.
+# -----------------------------------------------------------------------------
+RUN set -eu; \
+    if [ "${BAKE_VECTOR_EXTENSION}" = "1" ]; then \
+      echo "[build] baking VECTOR extension into \$HOME/.lbdb"; \
+      GITNEXUS_LBUG_MAX_DB_SIZE=17179869184 \
+        node gitnexus/scripts/install-duckdb-extension.mjs vector; \
+      GITNEXUS_LBUG_MAX_DB_SIZE=17179869184 \
+        node gitnexus/scripts/install-duckdb-extension.mjs vector --verify-only; \
+    else \
+      echo "[build] skipping VECTOR extension (BAKE_VECTOR_EXTENSION=${BAKE_VECTOR_EXTENSION})"; \
+    fi
+
+RUN set -eu; \
+    if [ -n "${HF_ENDPOINT}" ]; then echo "[build] HF_ENDPOINT=${HF_ENDPOINT}"; fi; \
+    if [ "${BAKE_EMBEDDINGS}" = "1" ]; then \
+      echo "[build] installing the local embedding stack into \$HOME/.gitnexus/embedding-runtime"; \
+      HF_ENDPOINT="${HF_ENDPOINT}" node gitnexus/dist/cli/index.js embeddings install; \
+      echo "[build] pre-downloading the default embedding model"; \
+      rm -rf /tmp/gitnexus-warmup /tmp/gitnexus-warmup-home; \
+      mkdir -p /tmp/gitnexus-warmup/src; \
+      printf 'export const warmed = 1;\nexport function use(): number { return warmed; }\n' \
+        > /tmp/gitnexus-warmup/src/warmup.ts; \
+      printf '{"name":"gitnexus-warmup","version":"1.0.0"}\n' \
+        > /tmp/gitnexus-warmup/package.json; \
+      HF_ENDPOINT="${HF_ENDPOINT}" GITNEXUS_HOME=/tmp/gitnexus-warmup-home \
+      GITNEXUS_LBUG_EXTENSION_INSTALL=load-only \
+        node gitnexus/dist/cli/index.js analyze /tmp/gitnexus-warmup --skip-git --embeddings; \
+      rm -rf /tmp/gitnexus-warmup /tmp/gitnexus-warmup-home; \
+    else \
+      echo "[build] skipping local embeddings (BAKE_EMBEDDINGS=${BAKE_EMBEDDINGS})"; \
+    fi
+
+# -----------------------------------------------------------------------------
+# 9. Root-owned finishing touches
+#
+#   `/usr/local/bin/gitnexus` exposes the built CLI on $PATH. The `gitnexus` bin
+#   in package.json (dist/cli/index.js, which carries a shebang and 755 perms)
+#   is not linked by npm because nothing depends on the package itself; without
+#   this link the documented `gitnexus serve` / `gitnexus index <path>` will not
+#   resolve from $PATH.
+#
+#   `gitnexus-rebuild` is the in-container rebuild entry point. tsc build-info
+#   files go stale if dist/ is deleted by hand: gitnexus-shared is
+#   `composite: true` and gitnexus-web builds with `tsc -b`, so tsc believes the
+#   output already exists, emits nothing, and the next compile then fails with
+#   "Cannot find module 'gitnexus-shared'". A normal edit-and-rebuild never hits
+#   this, so the helper takes the fast path first and only clears build info
+#   (then retries once) if that path genuinely failed.
+# -----------------------------------------------------------------------------
+USER root
+RUN ln -sf /app/gitnexus/dist/cli/index.js /usr/local/bin/gitnexus \
+ && mkdir -p /data/gitnexus \
+ && chown -R node:node /data \
+ && printf '%s\n' \
+      '#!/bin/sh' \
+      '# Rebuild GitNexus from /app in place. Safe to run repeatedly.' \
+      'set -eu' \
+      'cd /app' \
+      'if ! npm run build:web --prefix gitnexus; then' \
+      '  echo "[rebuild] first pass failed; clearing stale TypeScript build info and retrying" >&2' \
+      '  find . -maxdepth 2 -name "*.tsbuildinfo" -not -path "./node_modules/*" -delete' \
+      '  exec npm run build:web --prefix gitnexus' \
+      'fi' \
+      > /usr/local/bin/gitnexus-rebuild \
+ && chmod 755 /usr/local/bin/gitnexus-rebuild
+
+# -----------------------------------------------------------------------------
+# 10. Self test — fail the build instead of shipping something broken
+#
+#   Runs as `node` so any file it creates stays node-owned. Checks the
+#   artifacts and the toolchain the image promises, then actually indexes a
+#   throwaway repository: that last part is the real acceptance test, because it
+#   loads the native LadybugDB addon, the graph store and the FTS extension, and
+#   drives the tree-sitter grammars end to end. It ends by running the same
+#   `gitnexus-rebuild` command the user will run, proving the in-container
+#   rebuild loop works in the shipped image.
+#
+#   GITNEXUS_LBUG_EXTENSION_INSTALL=load-only keeps this offline and
+#   deterministic: otherwise `analyze` spends up to 15s trying to reach
+#   extension.ladybugdb.com for the VECTOR extension. Scoped to this RUN only —
+#   the runtime keeps upstream's default (analyze = auto).
+# -----------------------------------------------------------------------------
+USER node
+RUN set -eu; \
+    if [ "${SKIP_SELF_TEST}" = "1" ]; then echo "[build] self test skipped"; exit 0; fi; \
+    echo "[build] verifying artifacts"; \
+    test -f gitnexus/dist/cli/index.js; \
+    test -f gitnexus-shared/dist/index.js; \
+    test -f gitnexus-web/dist/index.html; \
+    test -f gitnexus/web/index.html; \
+    test -x /usr/local/bin/gitnexus-rebuild; \
+    echo "[build] verifying the rebuild toolchain is present"; \
+    command -v python3 >/dev/null; \
+    command -v make >/dev/null; \
+    command -v g++ >/dev/null; \
+    command -v node-gyp >/dev/null; \
+    command -v npm >/dev/null; \
+    command -v git >/dev/null; \
+    for bin in tsc tsx vite vitest; do \
+      test -x "gitnexus/node_modules/.bin/$bin" || test -x "gitnexus-web/node_modules/.bin/$bin"; \
+    done; \
+    echo "[build] CLI smoke test"; \
+    gitnexus --version; \
+    echo "[build] native addon + FTS extension smoke test"; \
+    rm -rf /tmp/gitnexus-selftest-home /tmp/gitnexus-doctor.txt; \
+    GITNEXUS_HOME=/tmp/gitnexus-selftest-home node gitnexus/dist/cli/index.js doctor \
+      > /tmp/gitnexus-doctor.txt 2>&1; \
+    cat /tmp/gitnexus-doctor.txt; \
+    grep -q 'lbugjs.node loaded' /tmp/gitnexus-doctor.txt; \
+    grep -Eq 'Graph store:[[:space:]]+available' /tmp/gitnexus-doctor.txt; \
+    grep -Eq 'Full-text search:[[:space:]]+available' /tmp/gitnexus-doctor.txt; \
+    echo "[build] end-to-end analyze of a throwaway repo"; \
+    rm -rf /tmp/gitnexus-selftest; \
+    mkdir -p /tmp/gitnexus-selftest/src; \
+    printf 'export function hello(name: string): string { return "hi " + name; }\nexport class Greeter { greet(): string { return hello("world"); } }\n' \
+      > /tmp/gitnexus-selftest/src/index.ts; \
+    printf '{"name":"gitnexus-selftest","version":"1.0.0"}\n' \
+      > /tmp/gitnexus-selftest/package.json; \
+    GITNEXUS_HOME=/tmp/gitnexus-selftest-home \
+    GITNEXUS_LBUG_EXTENSION_INSTALL=load-only \
+      node gitnexus/dist/cli/index.js analyze /tmp/gitnexus-selftest --skip-git; \
+    rm -rf /tmp/gitnexus-selftest /tmp/gitnexus-selftest-home /tmp/gitnexus-doctor.txt; \
+    echo "[build] proving the in-container rebuild entry point works"; \
+    gitnexus-rebuild; \
+    gitnexus --version; \
+    test -f gitnexus/web/index.html; \
+    echo "[build] self test passed"
+
+# -----------------------------------------------------------------------------
+# 11. Trim the npm cache
+#
+#   Everything already resolved lives in node_modules, and rebuilding this
+#   project needs no network, so the ~1 GB npm cache is dead weight. Runs as
+#   `node` so it clears the cache npm actually used; as root it would clean a
+#   nonexistent /root/.npm and leave the real one in the image. The registry
+#   stays reachable for dependencies you add later.
+# -----------------------------------------------------------------------------
+RUN npm cache clean --force
+
+# -----------------------------------------------------------------------------
+# 12. Runtime contract (unchanged from Dockerfile.cli)
+# -----------------------------------------------------------------------------
+USER node
+
+# GITNEXUS_HOME is the global registry + index store; mount a volume there.
+# The web UI expects the API on http://localhost:4747 — keep that contract.
+ENV GITNEXUS_HOME=/data/gitnexus \
+    GITNEXUS_NO_UPDATE_NOTIFIER=1 \
+    PORT=4747 \
+    HF_ENDPOINT=${HF_ENDPOINT}
+
+EXPOSE 4747
+
+# Shell form is required here so an injected $PORT is expanded at run time;
+# the JSON form hadolint prefers would exec `curl` directly and break that.
+# hadolint ignore=DL3025
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:${PORT:-4747}/api/health" || exit 1
+
+# `gitnexus serve` hosts both the API and the web UI on this one port, so a
+# single container replaces the two-container docker-compose.yaml setup. `sh -c`
+# expands an injected $PORT; `exec` keeps the server as PID 1 so SIGTERM still
+# reaches it and shutdown stays graceful.
+# hadolint ignore=DL3025
+CMD ["sh", "-c", "exec gitnexus serve --host 0.0.0.0 --port \"${PORT:-4747}\""]

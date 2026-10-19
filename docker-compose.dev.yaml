@@ -1,0 +1,61 @@
+# Single-container GitNexus: API + Web UI + source + full build toolchain.
+#
+#   docker compose -f docker-compose.dev.yaml up -d --build
+#
+# Then open http://localhost:4747
+#
+# This replaces the two-container setup in docker-compose.yaml: `gitnexus serve`
+# publishes the API *and* the Web UI on port 4747, so the separate gitnexus-web
+# container is unnecessary here.
+#
+# Build must happen from the repository root (this file's directory).
+
+services:
+  gitnexus:
+    user : "0:0"
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      # Uncomment to enable the optional extras (see README.md).
+      # args:
+      #   NPM_REGISTRY: https://registry.npmmirror.com
+      #   BAKE_VECTOR_EXTENSION: '1'
+      #   BAKE_EMBEDDINGS: '1'
+      #   HF_ENDPOINT: https://hf-mirror.com
+    image: gitnexus:dev
+    container_name: gitnexus-dev
+    # The image's own default CMD already runs `gitnexus serve`, so setting this
+    # is optional. It is spelled out here so the port is obvious in the compose
+    # file. `sh -c` (not `bash -lc`) matches the image's CMD: /etc/profile would
+    # overwrite PATH, and while the base image's profile does include
+    # /usr/local/bin, there is no reason to depend on that.
+    command: ['sh', '-c', 'exec gitnexus serve --host 0.0.0.0 --port 4747']
+    ports:
+      - '${SERVER_HOST_PORT:-4747}:4747'
+    volumes:
+      # Persist the global registry and indexes across container restarts.
+      - gitnexus-data:/data/gitnexus
+      # Mount the repos you want to index. Read-only by default; switch to
+      # `:rw` only if you want GitNexus to fix up the checkout.
+      - ${WORKSPACE_DIR:-./workspace}:/workspace:ro
+      # Optional: keep your edits and rebuilds across `docker compose down`.
+      # Mounting the whole source tree over the image copy is the fastest way
+      # to iterate, at the cost of hiding the baked-in source:
+      # - ./:/app
+    environment:
+      # Admit browser write routes from a specific origin. Needed only when you
+      # open the UI through a non-localhost address (LAN IP, hostname, proxy):
+      # a wildcard bind otherwise admits loopback origins only.
+      #   GITNEXUS_PUBLIC_ORIGIN: ${GITNEXUS_PUBLIC_ORIGIN:-}
+      - GITNEXUS_HOME=/data/gitnexus
+      - GITNEXUS_NO_UPDATE_NOTIFIER=1
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:4747/api/health']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  gitnexus-data:
